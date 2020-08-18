@@ -1,4 +1,4 @@
-{-# LANGUAGE RecordWildCards, ViewPatterns, NamedFieldPuns #-}
+{-# LANGUAGE RecordWildCards, ViewPatterns, NamedFieldPuns, PatternSynonyms #-}
 {- HLINT ignore "Use camelCase" -}
 
 -- | Module containing the plugin.
@@ -13,6 +13,7 @@ import qualified GHC
 import qualified GhcPlugins as GHC
 import SrcLoc
 import TcEvidence
+import Data.Maybe (fromMaybe, isNothing)
 
 
 ---------------------------------------------------------------------
@@ -35,8 +36,21 @@ setL l (L _ x) = L l x
 mod_records :: GHC.ModuleName
 mod_records = GHC.mkModuleName "GHC.Records.Extra"
 
+mod_maybe :: GHC.ModuleName
+mod_maybe = GHC.mkModuleName "GHC.Maybe"
+
+mod_beam :: GHC.ModuleName
+mod_beam = GHC.mkModuleName "Database.Beam"
+
+mod_functorIdentity :: GHC.ModuleName
+mod_functorIdentity = GHC.mkModuleName "Data.Functor.Identity"
+
+var_IdentityTy :: GHC.RdrName
+var_IdentityTy = GHC.mkRdrQual mod_functorIdentity $ GHC.mkTcOcc "Identity"
+
 var_HasField, var_hasField, var_getField, var_setField, var_dot :: GHC.RdrName
 var_HasField = GHC.mkRdrQual mod_records $ GHC.mkClsOcc "HasField"
+var_Maybe = GHC.mkRdrQual mod_maybe $ GHC.mkTcOcc "Maybe"
 var_hasField = GHC.mkRdrUnqual $ GHC.mkVarOcc "hasField"
 var_getField = GHC.mkRdrQual mod_records $ GHC.mkVarOcc "getField"
 var_setField = GHC.mkRdrQual mod_records $ GHC.mkVarOcc "setField"
@@ -45,13 +59,19 @@ var_dot = GHC.mkRdrUnqual $ GHC.mkVarOcc "."
 
 onModule :: HsModule GhcPs -> HsModule GhcPs
 onModule x = x { hsmodImports = onImports $ hsmodImports x
-               , hsmodDecls = concatMap onDecl $ hsmodDecls x
+               , hsmodDecls = concatMap (onDecl x) $ hsmodDecls x
                }
 
 
 onImports :: [LImportDecl GhcPs] -> [LImportDecl GhcPs]
-onImports = (:) $ qualifiedImplicitImport mod_records
+onImports is = qualifiedImplicitImport mod_records
+             : qualifiedImplicitImport mod_functorIdentity
+             : qualifiedImplicitImport mod_maybe
+             : is
 
+
+pattern LTypeVar idP <- L _ (HsTyVar _ _ (L _ idP))
+pattern LTypeApp lt rt <- (L _ (HsAppTy _ lt rt))
 
 {-
 instance Z.HasField "name" (Company) (String) where hasField _r = (\_x -> _r{name=_x}, (name:: (Company) -> String) _r)
@@ -59,14 +79,74 @@ instance Z.HasField "name" (Company) (String) where hasField _r = (\_x -> _r{nam
 instance HasField "selector" Record Field where
     hasField r = (\x -> r{selector=x}, (name :: Record -> Field) r)
 -}
-instanceTemplate :: FieldOcc GhcPs -> HsType GhcPs -> HsType GhcPs -> InstDecl GhcPs
-instanceTemplate selector record field = ClsInstD noE $ ClsInstDecl noE (HsIB noE typ) (unitBag has) [] [] [] Nothing
+instanceTemplate :: HsModule GhcPs -> FieldOcc GhcPs -> HsType GhcPs -> HsType GhcPs -> InstDecl GhcPs
+instanceTemplate ctx selector record field = ClsInstD noE $ ClsInstDecl noE (HsIB noE typ) (unitBag has) [] [] [] Nothing
     where
+        checkRecordTy :: Maybe (IdP GhcPs, HsType GhcPs)
+        checkRecordTy = case record of
+          HsAppTy x l (LTypeVar idPVar) -> let
+            newTy = HsAppTy x l (noL $ HsTyVar noE GHC.NotPromoted (noL var_IdentityTy))
+            in Just (idPVar, newTy)
+          _ -> Nothing
+
+        checkFieldTy :: IdP GhcPs -> Maybe (HsType GhcPs)
+        checkFieldTy fIdP = case field of
+          HsAppTy _ (LTypeApp (LTypeVar famC) (LTypeVar f)) (L _ fType)
+            | fIdP == f -> if isBeamType "C" famC then Just fType else Nothing
+
+          HsAppTy _ (LTypeApp (LTypeVar famC) (L _ (HsParTy _ (LTypeApp (LTypeVar modif) (LTypeVar f))))) (L _ fType) ->  let
+            isFFromDataDecl = fIdP == f
+            isModifierNullable = isBeamType "Nullable" modif
+            isBeamC = isBeamType "C" famC
+            maybeTy = HsAppTy noE (noL $ HsTyVar noE GHC.NotPromoted (noL var_Maybe)) (noL fType)
+            in if isFFromDataDecl && isModifierNullable && isBeamC then Just maybeTy else Nothing
+
+          _ -> Nothing
+
+        isBeamType name ty = case ty of
+          GHC.Orig (GHC.Module _ modName) _ -> isDatabaseBeamImport modName
+          GHC.Qual modName _                -> case lookUpQualImport ctx modName of
+            Just modFullName -> isDatabaseBeamImport modFullName
+            _ -> False
+          GHC.Unqual n -> GHC.occNameString n == name && hasUnqualImport ctx mod_beam
+          _ -> False
+
+        isDatabaseBeamImport :: GHC.ModuleName -> Bool
+        isDatabaseBeamImport name = case wordsBy (== '.') (GHC.moduleNameString name) of
+          "Database":"Beam":_ -> True
+          _ -> False
+
+        hasUnqualImport :: HsModule GhcPs -> GHC.ModuleName -> Bool
+        hasUnqualImport mod qualName = let
+          importDeclsL = hsmodImports mod
+          importDecls = unLoc <$> importDeclsL
+          foo :: GHC.ImportDecl GhcPs -> Bool
+          foo d = let
+            name = unLoc (ideclName d)
+            noAsClause = isNothing (ideclAs d)
+            in noAsClause && name == qualName
+          in any foo importDecls
+
+        lookUpQualImport :: HsModule GhcPs -> GHC.ModuleName -> Maybe GHC.ModuleName
+        lookUpQualImport mod qualName =
+          let imports = do
+                importDeclL <- hsmodImports mod
+                let importDecl = unLoc importDeclL
+                case ideclAs importDecl of
+                  Nothing -> []
+                  Just (L _ qualName) -> pure (qualName, unLoc $ ideclName importDecl)
+          in snd <$> find (\(name, _) -> name == qualName) imports
+
+        (newRecortTy, newFieldTy) = fromMaybe (record, field) $ do
+          (tyVar, recTy) <- checkRecordTy
+          fieldTy <- checkFieldTy tyVar
+          pure (recTy, fieldTy)
+
         typ = mkHsAppTys
             (noL (HsTyVar noE GHC.NotPromoted (noL var_HasField)))
             [noL (HsTyLit noE (HsStrTy GHC.NoSourceText (GHC.occNameFS $ GHC.occName $ unLoc $ rdrNameFieldOcc selector)))
-            ,noL record
-            ,noL field
+            ,noL newRecortTy
+            ,noL newFieldTy
             ]
 
         has :: LHsBindLR GhcPs GhcPs
@@ -97,12 +177,12 @@ instanceTemplate selector record field = ClsInstD noE $ ClsInstDecl noE (HsIB no
         vX = GHC.mkRdrUnqual $ GHC.mkVarOcc "x"
 
 
-onDecl :: LHsDecl GhcPs -> [LHsDecl GhcPs]
-onDecl o@(L _ (GHC.TyClD _ x)) = o :
-    [ noL $ InstD noE $ instanceTemplate field (unLoc record) (unbang typ)
+onDecl :: HsModule GhcPs -> LHsDecl GhcPs -> [LHsDecl GhcPs]
+onDecl ctx o@(L _ (GHC.TyClD _ x)) = o :
+    [ noL $ InstD noE $ instanceTemplate ctx field (unLoc record) (unbang typ)
     | let fields = nubOrdOn (\(_,_,x,_) -> GHC.occNameFS $ GHC.rdrNameOcc $ unLoc $ rdrNameFieldOcc x) $ getFields x
     , (record, _, field, typ) <- fields]
-onDecl x = [descendBi onExp x]
+onDecl ctx x = [descendBi onExp x]
 
 unbang :: HsType GhcPs -> HsType GhcPs
 unbang (HsBangTy _ _ x) = unLoc x
